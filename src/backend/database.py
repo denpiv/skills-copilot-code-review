@@ -2,14 +2,169 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+import copy
+import logging
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+logger = logging.getLogger(__name__)
+
+
+class _UpdateResult:
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+def _get_nested_value(document, field_path):
+    """Resolve dotted path values from nested dicts."""
+    value = document
+    for part in field_path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _matches_query(document, query):
+    for key, expected in query.items():
+        actual = _get_nested_value(document, key)
+        if isinstance(expected, dict):
+            for operator, operand in expected.items():
+                if operator == "$in":
+                    if isinstance(actual, list):
+                        if not any(item in actual for item in operand):
+                            return False
+                    elif actual not in operand:
+                        return False
+                elif operator == "$gte":
+                    if actual is None or actual < operand:
+                        return False
+                elif operator == "$lte":
+                    if actual is None or actual > operand:
+                        return False
+                else:
+                    return False
+        else:
+            if actual != expected:
+                return False
+    return True
+
+
+class InMemoryCollection:
+    """Tiny subset of a Mongo collection API used by this project."""
+
+    def __init__(self):
+        self._documents = []
+
+    def count_documents(self, query):
+        return sum(1 for doc in self._documents if _matches_query(doc, query))
+
+    def insert_one(self, document):
+        self._documents.append(copy.deepcopy(document))
+
+    def find(self, query=None):
+        query = query or {}
+        for document in self._documents:
+            if _matches_query(document, query):
+                # Return copies so route-level pop() does not mutate storage.
+                yield copy.deepcopy(document)
+
+    def find_one(self, query):
+        for document in self.find(query):
+            return document
+        return None
+
+    def update_one(self, query, update):
+        for idx, document in enumerate(self._documents):
+            if not _matches_query(document, query):
+                continue
+
+            updated = copy.deepcopy(document)
+            modified = 0
+
+            for operator, payload in update.items():
+                if operator == "$push":
+                    for field, value in payload.items():
+                        if field not in updated:
+                            updated[field] = []
+                        if not isinstance(updated[field], list):
+                            continue
+                        updated[field].append(value)
+                        modified += 1
+                elif operator == "$pull":
+                    for field, value in payload.items():
+                        if field in updated and isinstance(updated[field], list) and value in updated[field]:
+                            updated[field].remove(value)
+                            modified += 1
+
+            if modified > 0:
+                self._documents[idx] = updated
+            return _UpdateResult(modified_count=modified)
+
+        return _UpdateResult(modified_count=0)
+
+    def aggregate(self, pipeline):
+        """Supports only the exact pipeline used by /activities/days."""
+        docs = [copy.deepcopy(doc) for doc in self._documents]
+
+        for stage in pipeline:
+            if "$unwind" in stage:
+                field_path = stage["$unwind"].lstrip("$")
+                unwound = []
+                for doc in docs:
+                    values = _get_nested_value(doc, field_path)
+                    if not isinstance(values, list):
+                        continue
+                    for value in values:
+                        new_doc = copy.deepcopy(doc)
+                        target = new_doc
+                        parts = field_path.split(".")
+                        for part in parts[:-1]:
+                            target = target.get(part, {})
+                        target[parts[-1]] = value
+                        unwound.append(new_doc)
+                docs = unwound
+            elif "$group" in stage:
+                group_field = stage["$group"]["_id"].lstrip("$")
+                grouped_values = sorted({
+                    _get_nested_value(doc, group_field)
+                    for doc in docs
+                    if _get_nested_value(doc, group_field) is not None
+                })
+                docs = [{"_id": value} for value in grouped_values]
+            elif "$sort" in stage:
+                sort_fields = stage["$sort"]
+                if "_id" in sort_fields:
+                    reverse = sort_fields["_id"] < 0
+                    docs = sorted(docs, key=lambda d: d.get("_id"), reverse=reverse)
+
+        for doc in docs:
+            yield doc
+
+
+def _create_collections():
+    """Connect to MongoDB, or gracefully fallback to in-memory collections."""
+    try:
+        mongo_client = MongoClient(
+            "mongodb://localhost:27017/",
+            serverSelectionTimeoutMS=1500,
+        )
+        # Force a connection attempt at startup.
+        mongo_client.admin.command("ping")
+        mongo_db = mongo_client["mergington_high"]
+        logger.info("Connected to MongoDB at localhost:27017")
+        return mongo_client, mongo_db["activities"], mongo_db["teachers"]
+    except PyMongoError as exc:
+        logger.warning(
+            "MongoDB unavailable (%s). Falling back to in-memory datastore.",
+            exc,
+        )
+        return None, InMemoryCollection(), InMemoryCollection()
+
+
+# Connect to MongoDB or fallback to in-memory storage.
+client, activities_collection, teachers_collection = _create_collections()
 
 # Methods
 
